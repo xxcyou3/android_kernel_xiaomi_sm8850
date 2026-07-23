@@ -1,0 +1,199 @@
+name: Build SukiSU Ultra + KPM + SUSFS for Xiaomi 17
+
+on:
+  workflow_dispatch:
+    inputs:
+      sukisu_ref:
+        description: 'SukiSU-Ultra ref (commit/tag/branch)'
+        required: false
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: kernel_source
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git libncurses5-dev bc bison \
+            flex libssl-dev p7zip-full lz4 cpio curl libelf-dev dwarves jq lld \
+            pahole libdw-dev python3 zstd clang llvm
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Setup cross-linker compat
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          for name in arm-linux-gnueabi-ld arm-linux-gnueabi-ld.bfd; do
+            if ! command -v "$name" &>/dev/null; then
+              ln -sf "$(command -v ld.lld)" "$HOME/.local/bin/$name"
+            fi
+          done
+
+      - name: Clone and integrate SukiSU-Ultra
+        run: |
+          cd kernel_source
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+          cd KernelSU
+          SUKISU_COMMIT=$(git rev-parse --short HEAD)
+          echo "SUKISU_COMMIT=$SUKISU_COMMIT" >> $GITHUB_ENV
+          echo "$SUKISU_COMMIT" > ../KERNELSU_VERSION.txt
+          cd ..
+
+      - name: Apply SUSFS patches
+        run: |
+          cd kernel_source
+          git clone --depth=1 -b gki-android16-6.12 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
+          
+          # Copy ALL SUSFS header files
+          cp -f /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          cp -f /tmp/susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
+          
+          # Copy SUSFS source file
+          cp -f /tmp/susfs4ksu/kernel_patches/fs/susfs.c fs/
+          
+          # Apply SUSFS kernel patch
+          SUSFS_PATCH="/tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch"
+          if [ -f "$SUSFS_PATCH" ]; then
+            echo "[+] Applying SUSFS kernel patch"
+            patch -p1 --force --fuzz=3 < "$SUSFS_PATCH" || echo "[-] Patch conflict (continuing)"
+          else
+            echo "[!] SUSFS patch not found!"
+            exit 1
+          fi
+          
+          # Verify
+          for f in include/linux/susfs.h include/linux/susfs_def.h fs/susfs.c; do
+            if [ -f "$f" ]; then
+              echo "[+] VERIFIED: $f exists"
+            else
+              echo "[!] FATAL: $f missing!"
+              exit 1
+            fi
+          done
+
+      - name: Fix SukiSU-Ultra compatibility with kernel 6.12
+        run: |
+          cd kernel_source
+          
+          # Fix 1: super_access.c - remove cb_mutex from netlink_kernel_cfg
+          # The cb_mutex member was removed from netlink_kernel_cfg in newer kernels
+          sed -i '/DEFINE_MEMBER(netlink_kernel_cfg, cb_mutex)/d' drivers/kernelsu/kpm/super_access.c
+          echo "[+] Fixed super_access.c: removed cb_mutex member"
+          
+          # Fix 2: lsm_hook.c - security_add_hooks requires const struct lsm_id* not char*
+          # Add a static lsm_id struct and use it
+          sed -i '/void __init ksu_lsm_hook_init/i\static const struct lsm_id ksu_lsm_id = { .name = "ksu", .id = 0 };' drivers/kernelsu/hook/lsm_hook.c
+          sed -i 's/security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), "ksu")/security_add_hooks(ksu_hooks, ARRAY_SIZE(ksu_hooks), \&ksu_lsm_id)/' drivers/kernelsu/hook/lsm_hook.c
+          echo "[+] Fixed lsm_hook.c: use struct lsm_id instead of char*"
+          
+          # Fix 3: Disable ReKernel
+          ./scripts/config --file arch/arm64/configs/gki_defconfig -d CONFIG_REKERNEL
+          ./scripts/config --file arch/arm64/configs/gki_defconfig -d CONFIG_DEBUG_INFO_BTF
+          echo "[+] Disabled BTF to fix resolve_btfids error"
+          echo "[+] Disabled ReKernel"
+
+      - name: Enable KPM and SUSFS in kernel config
+        run: |
+          cd kernel_source
+          ./scripts/config --file arch/arm64/configs/gki_defconfig \
+            -e CONFIG_KSU \
+            -e CONFIG_KPM \
+            -e CONFIG_KSU_SUSFS
+          echo "[+] Config updated"
+
+      - name: Build kernel
+        run: |
+          cd kernel_source
+          make ARCH=arm64 CC=clang LLVM=1 gki_defconfig
+          ./scripts/config --file .config \
+            -e CONFIG_KSU \
+            -e CONFIG_KPM \
+            -e CONFIG_KSU_SUSFS \
+            -d CONFIG_REKERNEL \
+            -d CONFIG_DEBUG_INFO_BTF
+          make ARCH=arm64 CC=clang LLVM=1 -j$(nproc) olddefconfig
+          make ARCH=arm64 CC=clang LLVM=1 -j$(nproc)
+          echo "[+] Build completed"
+          ls -la arch/arm64/boot/Image* 2>/dev/null || echo "[!] No Image found"
+
+      - name: Find kernel image
+        run: |
+          cd kernel_source
+          IMAGE=""
+          for path in \
+            arch/arm64/boot/Image \
+            arch/arm64/boot/Image.gz-dtb \
+            arch/arm64/boot/Image.gz; do
+            if [ -f "$path" ]; then
+              IMAGE="$path"
+              break
+            fi
+          done
+          if [ -z "$IMAGE" ]; then
+            echo "[!] No kernel image found!"
+            find . -name "Image*" -type f 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "KERNEL_IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "[+] Found kernel image: $IMAGE"
+
+      - name: Package AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          cp "../kernel_source/${{ env.KERNEL_IMAGE }}" Image
+          cat > anykernel.sh << 'EOF'
+          KERNEL_STRING=Mi17_Kernel-SukiSU-Ultra-KPM-SUSFS
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          block=auto;
+          EOF
+          DATE=$(date +%Y%m%d-%H%M)
+          ZIP_NAME="Mi17_Kernel-6.12.23-android16-SukiSU-Ultra-${{ env.SUKISU_COMMIT }}-KPM-SUSFS-${DATE}.zip"
+          zip -r9 "$ZIP_NAME" . -x .git .github README.md
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mi17_SukiSU_Ultra_KPM_SUSFS
+          path: AnyKernel3/*.zip
+          retention-days: 30
+
+      - name: Create release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: SukiSU-Ultra-${{ env.SUKISU_COMMIT }}-${{ github.run_id }}
+          name: Mi17 SukiSU Ultra + KPM + SUSFS (${{ env.SUKISU_COMMIT }})
+          files: AnyKernel3/*.zip
+          prerelease: true
+          body: |
+            SukiSU Ultra + KPM + SUSFS Kernel for Xiaomi 17
+            - Kernel: 6.12.23 android16 GKI
+            - SukiSU Ultra: ${{ env.SUKISU_COMMIT }}
+            - KPM: Enabled
+            - SUSFS: Enabled
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            kernel_source/**/*.log
+          retention-days: 7
